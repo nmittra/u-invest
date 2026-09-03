@@ -224,3 +224,17 @@ export const IconSearch = (p: P) => (
     <path d="m15.2 15.2 4.8 4.8" />
   </svg>
 );
+
+export const IconRefresh = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3" />
+    <path d="M19.8 3.6v3.6h-3.6" />
+  </svg>
+);
+
+export const IconUpload = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M12 15V4M7.5 8.5 12 4l4.5 4.5" />
+    <path d="M4.5 19.5h15" />
+  </svg>
+);

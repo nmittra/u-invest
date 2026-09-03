@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ExitReason, Position, Toast, Vault, View } from "./lib/types";
+import type { Account, ExitReason, Position, Toast, Vault, View } from "./lib/types";
 import {
   advanceByCadence,
   createVault,
@@ -29,8 +29,11 @@ import { GutCheck } from "./components/GutCheck";
 import { Rulebook } from "./components/Rulebook";
 import { ClosedLedger } from "./components/ClosedLedger";
 import { SecurityModal } from "./components/SecurityModal";
+import { ImportCsvModal } from "./components/ImportCsvModal";
 import { ToastStack } from "./components/ui";
 import { IconLock, IconPulse, IconShield, LogoMark } from "./components/icons";
+import { fetchQuote, normalizeSymbol } from "./lib/quotes";
+import { buildPosition, type ImportRow } from "./lib/csv";
 
 export default function App() {
   const [meta, setMeta] = useState(() => getVaultMeta());
@@ -47,6 +50,9 @@ export default function App() {
   const [exitFor, setExitFor] = useState<{ p: Position; reason?: ExitReason } | null>(null);
   const [gutOpen, setGutOpen] = useState(false);
   const [secOpen, setSecOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [busyPrices, setBusyPrices] = useState<Record<string, boolean>>({});
+  const [refreshProg, setRefreshProg] = useState<{ done: number; total: number } | null>(null);
 
   /** The password lives only in memory while the book is open — needed to re-seal on every save. */
   const passwordRef = useRef<string | null>(null);
@@ -229,7 +235,10 @@ export default function App() {
 
   function updatePrice(id: string, priceVal: number) {
     const before = vault?.positions.find((x) => x.id === id);
-    mutate((v) => ({ ...v, positions: v.positions.map((x) => (x.id === id ? { ...x, currentPrice: priceVal } : x)) }));
+    mutate((v) => ({
+      ...v,
+      positions: v.positions.map((x) => (x.id === id ? { ...x, currentPrice: priceVal, lastPriceUpdate: Date.now() } : x)),
+    }));
     if (before && before.sleeve === 1 && before.stopPrice) {
       const wasBreached = before.currentPrice !== null && before.currentPrice <= before.stopPrice;
       const nowBreached = priceVal <= before.stopPrice;
@@ -307,6 +316,99 @@ export default function App() {
     mutate((v) => ({ ...v, positions: [...v.positions, s] }));
     setView("log");
     toast({ tone: "moss", title: "MRVL example loaded.", detail: "A Sleeve 2 core with invalidation facts and an add-on plan. Explore, then delete it." });
+  }
+
+  /* ---------------- live prices (free, keyless) ---------------- */
+
+  async function refreshOne(p: Position) {
+    if (busyPrices[p.id]) return;
+    setBusyPrices((b) => ({ ...b, [p.id]: true }));
+    try {
+      const q = await fetchQuote(p.ticker);
+      updatePrice(p.id, q.price);
+      toast({
+        tone: "moss",
+        title: `${p.ticker} → ${q.price.toFixed(2)}.`,
+        detail: `${q.source} · typically ~15-min delayed.`,
+      });
+    } catch {
+      toast({
+        tone: "flare",
+        title: `No quote for ${p.ticker}.`,
+        detail: "Free endpoints didn't return a price — check the symbol (Yahoo format, e.g. AAPL, SHEL.L) or set it by hand.",
+      });
+    } finally {
+      setBusyPrices((b) => ({ ...b, [p.id]: false }));
+    }
+  }
+
+  async function refreshAll() {
+    if (refreshProg || !positions.length) return;
+    setRefreshProg({ done: 0, total: positions.length });
+    let ok = 0;
+    let fail = 0;
+    for (let i = 0; i < positions.length; i++) {
+      const p = positions[i];
+      setBusyPrices((b) => ({ ...b, [p.id]: true }));
+      try {
+        const q = await fetchQuote(p.ticker);
+        updatePrice(p.id, q.price);
+        ok++;
+      } catch {
+        fail++;
+      }
+      setBusyPrices((b) => ({ ...b, [p.id]: false }));
+      setRefreshProg({ done: i + 1, total: positions.length });
+      await new Promise((r) => setTimeout(r, 350)); // be polite to the free endpoints
+    }
+    setRefreshProg(null);
+    if (ok > 0) {
+      toast({
+        tone: "moss",
+        title: `Updated ${ok} price${ok === 1 ? "" : "s"}.`,
+        detail: fail
+          ? `${fail} symbol${fail === 1 ? "" : "s"} returned no quote and were left unchanged.`
+          : "Free quotes via Yahoo Finance — typically ~15-min delayed.",
+      });
+    } else {
+      toast({
+        tone: "ember",
+        title: "No quotes came back.",
+        detail: "The free endpoints may be busy or rate-limited right now — try again in a minute, or update by hand.",
+      });
+    }
+  }
+
+  /* ---------------- CSV import ---------------- */
+
+  function handleImport(rows: ImportRow[]) {
+    if (!vault) return;
+    const acctByName = new Map<string, string>();
+    vault.accounts.forEach((a) => acctByName.set(a.name.toLowerCase(), a.id));
+    const newAccounts: Account[] = [];
+    let createdAccts = 0;
+    const fallbackId = selectedId !== "all" ? selectedId : (vault.accounts[0]?.id ?? "");
+    const newPositions = rows.map((r) => {
+      let accountId: string;
+      const name = (r.accountName ?? "").trim();
+      if (!name) accountId = fallbackId;
+      else if (acctByName.has(name.toLowerCase())) accountId = acctByName.get(name.toLowerCase())!;
+      else {
+        const na = freshAccount(name, null, "Other");
+        newAccounts.push(na);
+        acctByName.set(name.toLowerCase(), na.id);
+        createdAccts++;
+        accountId = na.id;
+      }
+      return buildPosition(r, accountId);
+    });
+    mutate((v) => ({ ...v, accounts: [...v.accounts, ...newAccounts], positions: [...v.positions, ...newPositions] }));
+    setImportOpen(false);
+    toast({
+      tone: "moss",
+      title: `Imported ${newPositions.length} position${newPositions.length === 1 ? "" : "s"}.`,
+      detail: `${createdAccts ? `${createdAccts} new account${createdAccts === 1 ? "" : "s"} created. ` : ""}Sleeves, stops and invalidation criteria were checked on the way in.`,
+    });
   }
 
   /* ---------------- render ---------------- */
@@ -436,6 +538,11 @@ export default function App() {
                   onExit={(p) => setExitFor({ p })}
                   onUpdatePrice={updatePrice}
                   onLoadSample={loadSample}
+                  onImportCsv={() => setImportOpen(true)}
+                  onRefreshAll={() => void refreshAll()}
+                  onRefreshOne={(p) => void refreshOne(p)}
+                  busyPrices={busyPrices}
+                  refreshProgress={refreshProg}
                 />
               )}
               {view === "rules" && <Rulebook profileName={ownerName} />}
@@ -480,6 +587,14 @@ export default function App() {
         />
       )}
       {gutOpen && <GutCheck onClose={() => setGutOpen(false)} />}
+      {importOpen && (
+        <ImportCsvModal
+          accounts={vault.accounts}
+          positions={vault.positions}
+          onImport={handleImport}
+          onClose={() => setImportOpen(false)}
+        />
+      )}
       {secOpen && (
         <SecurityModal
           ownerName={ownerName}

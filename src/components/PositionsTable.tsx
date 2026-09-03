@@ -1,9 +1,9 @@
 import { useState } from "react";
 import type { Position } from "../lib/types";
 import { addonSummary, cushionToStop, pct, pnlPct, price, stopBandState, stopBreached, stopDepth } from "../lib/calc";
-import { CADENCE_LABEL, daysUntil, fmtDate } from "../lib/store";
+import { CADENCE_LABEL, daysUntil, fmtDate, timeAgo } from "../lib/store";
 import { SleeveBadge, btnGhost, btnPrimary } from "./ui";
-import { IconAlert, IconCalendar, IconFlag, IconPencil, IconPlus, IconShield } from "./icons";
+import { IconAlert, IconCalendar, IconFlag, IconPencil, IconPlus, IconRefresh, IconShield, IconUpload } from "./icons";
 
 export function PositionsTable({
   positions,
@@ -14,6 +14,11 @@ export function PositionsTable({
   onExit,
   onUpdatePrice,
   onLoadSample,
+  onImportCsv,
+  onRefreshAll,
+  onRefreshOne,
+  busyPrices,
+  refreshProgress,
 }: {
   positions: Position[];
   accountName: string;
@@ -23,6 +28,11 @@ export function PositionsTable({
   onExit: (p: Position) => void;
   onUpdatePrice: (id: string, price: number) => void;
   onLoadSample: () => void;
+  onImportCsv: () => void;
+  onRefreshAll: () => void;
+  onRefreshOne: (p: Position) => void;
+  busyPrices: Record<string, boolean>;
+  refreshProgress: { done: number; total: number } | null;
 }) {
   return (
     <div className="space-y-5">
@@ -36,9 +46,23 @@ export function PositionsTable({
             One row per position, classified at purchase. <span className="text-fog-300">No position changes sleeves mid-drawdown.</span>
           </p>
         </div>
-        <button onClick={onNew} className={btnPrimary}>
-          <IconPlus size={15} /> New entry — run the checklist
-        </button>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <button onClick={onImportCsv} className={btnGhost}>
+            <IconUpload size={14} /> Import CSV
+          </button>
+          <button
+            onClick={onRefreshAll}
+            disabled={!!refreshProgress || positions.length === 0}
+            className={`${btnGhost} disabled:opacity-40 disabled:pointer-events-none`}
+            title="Fetch latest prices — free, no API key, typically ~15-min delayed"
+          >
+            <IconRefresh size={14} className={refreshProgress ? "animate-spin" : ""} />
+            {refreshProgress ? `Updating ${refreshProgress.done}/${refreshProgress.total}…` : "Refresh prices"}
+          </button>
+          <button onClick={onNew} className={btnPrimary}>
+            <IconPlus size={15} /> New entry — run the checklist
+          </button>
+        </div>
       </div>
 
       {positions.length === 0 ? (
@@ -57,6 +81,7 @@ export function PositionsTable({
           </p>
           <div className="mt-6 flex flex-wrap justify-center gap-3">
             <button onClick={onNew} className={btnPrimary}><IconPlus size={15} /> New entry</button>
+            <button onClick={onImportCsv} className={btnGhost}><IconUpload size={14} /> Import CSV</button>
             <button onClick={onLoadSample} className={btnGhost}>Load the MRVL example</button>
           </div>
         </div>
@@ -79,10 +104,12 @@ export function PositionsTable({
                     key={p.id}
                     p={p}
                     idx={idx}
+                    busy={!!busyPrices[p.id]}
                     onEdit={() => onEdit(p)}
                     onReview={() => onReview(p)}
                     onExit={() => onExit(p)}
                     onUpdatePrice={(v) => onUpdatePrice(p.id, v)}
+                    onRefresh={() => onRefreshOne(p)}
                   />
                 ))}
               </tbody>
@@ -90,7 +117,7 @@ export function PositionsTable({
           </div>
           <div className="px-4 py-3 border-t border-line flex flex-wrap gap-x-6 gap-y-1 items-center">
             <span className="font-mono text-[10.5px] text-fog-600 tracking-wide">
-              {positions.length} OPEN · CLICK A LAST PRICE TO UPDATE IT · S1 GAUGE SHOWS CUSHION TO STOP
+              {positions.length} OPEN · CLICK A LAST PRICE TO EDIT IT · REFRESH PULLS FREE QUOTES (YAHOO FINANCE, ~15-MIN DELAYED) · S1 GAUGE = CUSHION TO STOP
             </span>
           </div>
         </div>
@@ -104,17 +131,21 @@ export function PositionsTable({
 function Row({
   p,
   idx,
+  busy,
   onEdit,
   onReview,
   onExit,
   onUpdatePrice,
+  onRefresh,
 }: {
   p: Position;
   idx: number;
+  busy: boolean;
   onEdit: () => void;
   onReview: () => void;
   onExit: () => void;
   onUpdatePrice: (v: number) => void;
+  onRefresh: () => void;
 }) {
   const [editingPrice, setEditingPrice] = useState(false);
   const [priceDraft, setPriceDraft] = useState("");
@@ -166,20 +197,35 @@ function Row({
             }}
           />
         ) : (
-          <button
-            onClick={() => {
-              setPriceDraft(p.currentPrice ? String(p.currentPrice) : "");
-              setEditingPrice(true);
-            }}
-            className="font-mono text-[13px] text-fog-100 tabular border-b border-dashed border-pine-600 hover:border-moss-400 hover:text-moss-300 transition-colors cursor-text"
-            title="Update last price"
-          >
-            {p.currentPrice ? price(p.currentPrice) : "set price"}
-          </button>
+          <span className="inline-flex items-center gap-1.5">
+            <span key={p.lastPriceUpdate ?? -1} className="price-flash inline-block px-0.5 -mx-0.5">
+              <button
+                onClick={() => {
+                  setPriceDraft(p.currentPrice ? String(p.currentPrice) : "");
+                  setEditingPrice(true);
+                }}
+                className="font-mono text-[13px] text-fog-100 tabular border-b border-dashed border-pine-600 hover:border-moss-400 hover:text-moss-300 transition-colors cursor-text"
+                title="Update last price"
+              >
+                {p.currentPrice ? price(p.currentPrice) : "set price"}
+              </button>
+            </span>
+            <button
+              onClick={onRefresh}
+              disabled={busy}
+              className="p-1 rounded text-fog-600 hover:text-moss-300 hover:bg-pine-800 transition-colors disabled:opacity-60"
+              title="Fetch latest price — free quote, ~15-min delayed"
+            >
+              <IconRefresh size={12} className={busy ? "animate-spin" : ""} />
+            </button>
+          </span>
         )}
         <div className={`mt-0.5 font-mono text-[11.5px] tabular ${ch === null ? "text-fog-600" : ch >= 0 ? "text-moss-400" : "text-ember-400"}`}>
           {ch === null ? "—" : `${ch >= 0 ? "▲" : "▼"} ${pct(ch)}`}
         </div>
+        {p.lastPriceUpdate && (
+          <div className="mt-0.5 font-mono text-[10px] text-fog-600 tabular">upd {timeAgo(p.lastPriceUpdate)}</div>
+        )}
       </td>
       {/* size */}
       <td className="px-4 py-3.5">
