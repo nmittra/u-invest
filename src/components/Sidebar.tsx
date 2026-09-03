@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Account, Position, View } from "../lib/types";
+import { ACCOUNT_WRAPPERS } from "../lib/types";
 import { sumSize } from "../lib/calc";
 import { inputCls } from "./ui";
 import {
@@ -8,8 +9,10 @@ import {
   IconDesk,
   IconDownload,
   IconLock,
+  IconPencil,
   IconPlus,
   IconRows,
+  IconShield,
   IconX,
   LogoMark,
 } from "./icons";
@@ -29,9 +32,11 @@ export function Sidebar({
   selectedId,
   selectAccount,
   addAccount,
+  renameAccount,
   deleteAccount,
   positions,
   closedCount,
+  onOpenSecurity,
   onExport,
   onLock,
 }: {
@@ -41,16 +46,21 @@ export function Sidebar({
   accounts: Account[];
   selectedId: string; // "all" or account id
   selectAccount: (id: string) => void;
-  addAccount: (name: string, value: number | null) => void;
+  addAccount: (name: string, value: number | null, wrapper?: string) => void;
+  renameAccount: (id: string, name: string) => void;
   deleteAccount: (id: string) => void;
   positions: Position[];
   closedCount: number;
+  onOpenSecurity: () => void;
   onExport: () => void;
   onLock: () => void;
 }) {
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState("");
   const [value, setValue] = useState("");
+  const [wrapper, setWrapper] = useState<string>("Trading");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editName, setEditName] = useState("");
 
   const countFor = (id: string) =>
     id === "all" ? positions.length : positions.filter((p) => p.accountId === id).length;
@@ -61,14 +71,21 @@ export function Sidebar({
     e.preventDefault();
     if (!name.trim()) return;
     const v = parseFloat(value);
-    addAccount(name.trim(), Number.isFinite(v) && v > 0 ? v : null);
+    addAccount(name.trim(), Number.isFinite(v) && v > 0 ? v : null, wrapper);
     setName("");
     setValue("");
+    setWrapper("Trading");
     setAdding(false);
   }
 
+  function commitRename(id: string) {
+    const trimmed = editName.trim();
+    if (trimmed) renameAccount(id, trimmed);
+    setEditingId(null);
+  }
+
   return (
-    <aside className="hidden lg:flex flex-col w-[248px] shrink-0 border-r border-line bg-pine-900/60 backdrop-blur-sm sticky top-0 h-screen">
+    <aside className="hidden lg:flex flex-col w-[256px] shrink-0 border-r border-line bg-pine-900/60 backdrop-blur-sm sticky top-0 h-screen">
       {/* brand */}
       <div className="px-5 pt-6 pb-5 border-b border-line">
         <div className="flex items-center gap-2.5 text-moss-400">
@@ -124,9 +141,28 @@ export function Sidebar({
 
         {adding && (
           <form onSubmit={submitAdd} className="px-2 pb-3 space-y-2 fade-in">
+            <div className="flex flex-wrap gap-1">
+              {ACCOUNT_WRAPPERS.map((w) => (
+                <button
+                  type="button"
+                  key={w}
+                  onClick={() => {
+                    setWrapper(w);
+                    if (!name.trim()) setName(w);
+                  }}
+                  className={`px-2 py-0.5 rounded font-mono text-[10.5px] tracking-wide border transition-all duration-150 ${
+                    wrapper === w
+                      ? "border-moss-500 text-moss-300 bg-moss-500/10"
+                      : "border-line text-fog-500 hover:text-fog-200 hover:border-pine-600"
+                  }`}
+                >
+                  {w}
+                </button>
+              ))}
+            </div>
             <input
               className={`${inputCls} !py-2 text-[13px]`}
-              placeholder="Account name (e.g. Fidelity)"
+              placeholder="Account name (e.g. Trading 212 ISA)"
               value={name}
               onChange={(e) => setName(e.target.value)}
               autoFocus
@@ -153,13 +189,41 @@ export function Sidebar({
           />
           {accounts.map((a) => {
             const empty = countFor(a.id) === 0;
+            if (editingId === a.id) {
+              return (
+                <form
+                  key={a.id}
+                  className="px-2 py-1.5 fade-in"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    commitRename(a.id);
+                  }}
+                >
+                  <input
+                    autoFocus
+                    className={`${inputCls} !py-1.5 text-[13px]`}
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    onBlur={() => commitRename(a.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setEditingId(null);
+                    }}
+                  />
+                </form>
+              );
+            }
             return (
               <AccountRow
                 key={a.id}
                 label={a.name}
+                tag={a.wrapper}
                 sub={`${countFor(a.id)} open · ${sizeFor(a.id).toFixed(0)}% committed`}
                 active={selectedId === a.id}
                 onClick={() => selectAccount(a.id)}
+                onRename={() => {
+                  setEditingId(a.id);
+                  setEditName(a.name);
+                }}
                 onDelete={empty ? () => deleteAccount(a.id) : undefined}
                 deleteHint={empty ? undefined : "Move or close its positions first"}
               />
@@ -175,6 +239,12 @@ export function Sidebar({
 
       {/* footer */}
       <div className="px-3 py-4 border-t border-line space-y-1">
+        <button
+          onClick={onOpenSecurity}
+          className="w-full flex items-center gap-3 px-3 py-2 rounded-md text-[13px] text-fog-500 hover:text-moss-300 hover:bg-pine-800 transition-colors"
+        >
+          <IconShield size={15} /> Security & password
+        </button>
         <button
           onClick={onExport}
           className="w-full flex items-center gap-3 px-3 py-2 rounded-md text-[13px] text-fog-500 hover:text-fog-100 hover:bg-pine-800 transition-colors"
@@ -194,16 +264,20 @@ export function Sidebar({
 
 function AccountRow({
   label,
+  tag,
   sub,
   active,
   onClick,
+  onRename,
   onDelete,
   deleteHint,
 }: {
   label: string;
+  tag?: string;
   sub: string;
   active: boolean;
   onClick: () => void;
+  onRename?: () => void;
   onDelete?: () => void;
   deleteHint?: string;
 }) {
@@ -215,9 +289,28 @@ function AccountRow({
       onClick={onClick}
     >
       <div className="flex-1 px-3 py-2 min-w-0">
-        <div className={`text-[13px] font-medium truncate ${active ? "text-fog-100" : "text-fog-300"}`}>{label}</div>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className={`text-[13px] font-medium truncate ${active ? "text-fog-100" : "text-fog-300"}`}>{label}</span>
+          {tag && (
+            <span className="shrink-0 font-mono text-[8.5px] uppercase tracking-[0.08em] text-flare-300 border border-flare-500/40 bg-flare-500/10 rounded px-1 py-px leading-none">
+              {tag}
+            </span>
+          )}
+        </div>
         <div className="font-mono text-[10.5px] text-fog-600 tabular truncate">{sub}</div>
       </div>
+      {onRename && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onRename();
+          }}
+          className="p-1 rounded text-fog-600 opacity-0 group-hover:opacity-100 hover:text-moss-300 hover:bg-pine-900 transition-all"
+          aria-label={`Rename ${label}`}
+        >
+          <IconPencil size={12} />
+        </button>
+      )}
       {onDelete && (
         <button
           onClick={(e) => {

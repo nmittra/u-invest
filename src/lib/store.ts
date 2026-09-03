@@ -1,7 +1,10 @@
-import type { Account, Cadence, Position, Profile, Vault } from "./types";
+import type { Account, Cadence, ClosedPosition, Position, Vault } from "./types";
 
-const VAULT_KEY = "rulebook:vault:v1";
-const SESSION_KEY = "rulebook:session:v1";
+const VAULT_KEY_V2 = "rulebook:vault:v2"; // encrypted (AES-256-GCM)
+const VAULT_KEY_V1 = "rulebook:vault:v1"; // legacy plaintext — migrated on unlock
+
+/** Minutes of inactivity before the book locks itself. */
+export const IDLE_LOCK_MINUTES = 10;
 
 /* ---------------- ids ---------------- */
 
@@ -14,7 +17,67 @@ export function uid(): string {
   return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/* ---------------- password hashing ---------------- */
+/* ---------------- byte / base64 helpers ---------------- */
+
+const te = new TextEncoder();
+const td = new TextDecoder();
+
+function b64e(bytes: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(s);
+}
+
+function b64d(str: string): Uint8Array<ArrayBuffer> {
+  const bin = atob(str);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function randBytes(n: number): Uint8Array<ArrayBuffer> {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return b;
+}
+
+function enc(s: string): Uint8Array<ArrayBuffer> {
+  return te.encode(s) as Uint8Array<ArrayBuffer>;
+}
+
+const HAS_CRYPTO = typeof crypto !== "undefined" && !!crypto.subtle;
+
+/* ---------------- key derivation (PBKDF2 → AES-256-GCM) ---------------- */
+
+async function deriveKey(password: string, salt: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
+  const base = await crypto.subtle.importKey("raw", enc(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 150_000, hash: "SHA-256" },
+    base,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+/** Memory-only key cache so routine saves don't re-run 150k PBKDF2 rounds. */
+let keyCache: { pw: string; salt: string; key: CryptoKey } | null = null;
+
+async function getKey(password: string, saltB64: string): Promise<CryptoKey> {
+  if (keyCache && keyCache.pw === password && keyCache.salt === saltB64) return keyCache.key;
+  const key = await deriveKey(password, b64d(saltB64));
+  keyCache = { pw: password, salt: saltB64, key };
+  return key;
+}
+
+/** Drop the derived key from memory (called on lock / re-key / wipe). */
+export function forgetKey(): void {
+  keyCache = null;
+}
+
+/* ---------------- legacy hashing (v1 compat + non-secure-context fallback) ---------------- */
 
 function fallbackHash(input: string): string {
   let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
@@ -31,9 +94,8 @@ function fallbackHash(input: string): string {
 export async function hashPassword(salt: string, password: string): Promise<string> {
   const input = `${salt}::${password}`;
   try {
-    if (typeof crypto !== "undefined" && crypto.subtle) {
-      const data = new TextEncoder().encode(input);
-      const digest = await crypto.subtle.digest("SHA-256", data);
+    if (HAS_CRYPTO) {
+      const digest = await crypto.subtle.digest("SHA-256", te.encode(input));
       return Array.from(new Uint8Array(digest))
         .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
@@ -46,48 +108,181 @@ export async function hashPassword(salt: string, password: string): Promise<stri
 
 export function makeSalt(): string {
   try {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+    return b64e(randBytes(16));
   } catch {
     return Math.random().toString(36).slice(2) + Date.now().toString(36);
   }
 }
 
-/* ---------------- vault persistence ---------------- */
+/* ---------------- stored shapes ---------------- */
 
-export function loadVault(): Vault | null {
+interface StoredV2 {
+  v: 2;
+  /** owner's display name — the only unencrypted field, used for the greeting */
+  name: string;
+  salt: string;
+  iv: string;
+  data: string;
+}
+
+interface StoredV1 {
+  profile: { name: string; salt: string; hash: string };
+  accounts?: Account[];
+  positions?: Position[];
+  closed?: ClosedPosition[];
+}
+
+function readV2(): StoredV2 | null {
   try {
-    const raw = localStorage.getItem(VAULT_KEY);
+    const raw = localStorage.getItem(VAULT_KEY_V2);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as Vault;
-    if (!parsed || !parsed.profile) return null;
-    return {
-      accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
-      positions: Array.isArray(parsed.positions) ? parsed.positions : [],
-      closed: Array.isArray(parsed.closed) ? parsed.closed : [],
-      profile: parsed.profile,
-    };
+    const p = JSON.parse(raw) as Partial<StoredV2>;
+    return p && p.v === 2 && p.data ? (p as StoredV2) : null;
   } catch {
     return null;
   }
 }
 
-export function saveVault(vault: Vault): void {
+function readV1(): StoredV1 | null {
   try {
-    localStorage.setItem(VAULT_KEY, JSON.stringify(vault));
+    const raw = localStorage.getItem(VAULT_KEY_V1);
+    if (!raw) return null;
+    const p = JSON.parse(raw) as Partial<StoredV1>;
+    return p && p.profile ? (p as StoredV1) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function vaultExists(): boolean {
+  return !!(readV2() || readV1());
+}
+
+/** Public (unencrypted) metadata for the lock screen. Counts are hidden once encrypted. */
+export function getVaultMeta(): { name: string; counts: { open: number; accounts: number } | null } | null {
+  const v2 = readV2();
+  if (v2) return { name: v2.name, counts: null };
+  const v1 = readV1();
+  if (v1) {
+    return {
+      name: v1.profile.name,
+      counts: { open: v1.positions?.length ?? 0, accounts: v1.accounts?.length ?? 0 },
+    };
+  }
+  return null;
+}
+
+function normalize(parsed: Partial<Vault>): Vault {
+  return {
+    accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
+    positions: Array.isArray(parsed.positions) ? parsed.positions : [],
+    closed: Array.isArray(parsed.closed) ? parsed.closed : [],
+  };
+}
+
+/** Encrypt the vault with a fresh IV (and optionally a given salt). */
+async function seal(vault: Vault, name: string, password: string, saltB64?: string): Promise<StoredV2> {
+  const salt = saltB64 ? b64d(saltB64) : randBytes(16);
+  const key = await getKey(password, b64e(salt));
+  const iv = randBytes(12);
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc(JSON.stringify(vault)));
+  return { v: 2, name, salt: b64e(salt), iv: b64e(iv), data: b64e(new Uint8Array(ct)) };
+}
+
+/* ---------------- vault lifecycle ---------------- */
+
+export async function createVault(name: string, password: string, seed: Vault): Promise<Vault> {
+  if (HAS_CRYPTO) {
+    const stored = await seal(seed, name, password);
+    localStorage.setItem(VAULT_KEY_V2, JSON.stringify(stored));
+  } else {
+    const salt = makeSalt();
+    const hash = await hashPassword(salt, password);
+    localStorage.setItem(
+      VAULT_KEY_V1,
+      JSON.stringify({ profile: { name, salt, hash, createdAt: Date.now() }, ...seed }),
+    );
+  }
+  return seed;
+}
+
+/** Returns the decrypted vault, or null when the password doesn't open the seal. */
+export async function unlockVault(password: string): Promise<Vault | null> {
+  const v2 = readV2();
+  if (v2) {
+    if (!HAS_CRYPTO) return null; // encrypted vault in a non-secure context
+    try {
+      const key = await getKey(password, v2.salt);
+      const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64d(v2.iv) }, key, b64d(v2.data));
+      return normalize(JSON.parse(td.decode(pt)) as Partial<Vault>);
+    } catch {
+      return null; // wrong password — the seal held
+    }
+  }
+  const v1 = readV1();
+  if (v1) {
+    const h = await hashPassword(v1.profile.salt, password);
+    if (h !== v1.profile.hash) return null;
+    const vault = normalize(v1);
+    // Migrate legacy plaintext storage into the encrypted format immediately.
+    if (HAS_CRYPTO) {
+      try {
+        const stored = await seal(vault, v1.profile.name, password);
+        localStorage.setItem(VAULT_KEY_V2, JSON.stringify(stored));
+        localStorage.removeItem(VAULT_KEY_V1);
+      } catch {
+        /* keep the legacy copy */
+      }
+    }
+    return vault;
+  }
+  return null;
+}
+
+export async function persistVault(vault: Vault, name: string, password: string): Promise<void> {
+  try {
+    if (HAS_CRYPTO) {
+      const prev = readV2();
+      const stored = await seal(vault, name, password, prev?.salt);
+      localStorage.setItem(VAULT_KEY_V2, JSON.stringify(stored));
+    } else {
+      const salt = makeSalt();
+      const hash = await hashPassword(salt, password);
+      localStorage.setItem(
+        VAULT_KEY_V1,
+        JSON.stringify({ profile: { name, salt, hash, createdAt: Date.now() }, ...vault }),
+      );
+    }
   } catch {
     /* storage full or unavailable */
   }
 }
 
+/** Re-seal the whole book under a new password (fresh salt + key). */
+export async function rekeyVault(vault: Vault, name: string, newPassword: string): Promise<void> {
+  forgetKey();
+  if (HAS_CRYPTO) {
+    const stored = await seal(vault, name, newPassword);
+    localStorage.setItem(VAULT_KEY_V2, JSON.stringify(stored));
+    localStorage.removeItem(VAULT_KEY_V1);
+  } else {
+    const salt = makeSalt();
+    const hash = await hashPassword(salt, newPassword);
+    localStorage.setItem(
+      VAULT_KEY_V1,
+      JSON.stringify({ profile: { name, salt, hash, createdAt: Date.now() }, ...vault }),
+    );
+  }
+}
+
 export function wipeVault(): void {
   try {
-    localStorage.removeItem(VAULT_KEY);
-    sessionStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(VAULT_KEY_V2);
+    localStorage.removeItem(VAULT_KEY_V1);
   } catch {
     /* noop */
   }
+  forgetKey();
 }
 
 export function exportVault(vault: Vault): void {
@@ -100,24 +295,6 @@ export function exportVault(vault: Vault): void {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 800);
-}
-
-/* ---------------- session ---------------- */
-
-export function hasSession(): boolean {
-  try {
-    return sessionStorage.getItem(SESSION_KEY) === "open";
-  } catch {
-    return false;
-  }
-}
-
-export function openSession(): void {
-  try { sessionStorage.setItem(SESSION_KEY, "open"); } catch { /* noop */ }
-}
-
-export function closeSession(): void {
-  try { sessionStorage.removeItem(SESSION_KEY); } catch { /* noop */ }
 }
 
 /* ---------------- dates ---------------- */
@@ -195,10 +372,6 @@ export function samplePosition(accountId: string): Position {
   };
 }
 
-export function freshAccount(name: string, value: number | null): Account {
-  return { id: uid(), name, value, createdAt: Date.now() };
-}
-
-export function blankProfile(name: string, salt: string, hash: string): Profile {
-  return { name, salt, hash, createdAt: Date.now() };
+export function freshAccount(name: string, value: number | null, wrapper?: string): Account {
+  return { id: uid(), name, wrapper, value, createdAt: Date.now() };
 }

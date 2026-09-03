@@ -55,23 +55,21 @@ export interface ClosedPosition {
   closedAt: number;
 }
 
+/** Common wrapper types — presets, but any free-text label is allowed. */
+export const ACCOUNT_WRAPPERS = ["ISA", "SIPP", "Work Pension", "Trading", "Other"] as const;
+
 export interface Account {
   id: string;
   name: string;
-  /** approximate account value in USD, optional */
+  /** wrapper / account type, e.g. ISA, SIPP, Work Pension, Trading */
+  wrapper?: string;
+  /** approximate account value, optional */
   value: number | null;
   createdAt: number;
 }
 
-export interface Profile {
-  name: string;
-  salt: string;
-  hash: string;
-  createdAt: number;
-}
-
+/** Everything the vault holds — this whole object is encrypted at rest. */
 export interface Vault {
-  profile: Profile;
   accounts: Account[];
   positions: Position[];
   closed: ClosedPosition[];
