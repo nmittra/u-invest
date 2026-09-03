@@ -1,5 +1,15 @@
 @import "tailwindcss";
 
+/* brief green wash when a cell's value updates (live quotes) */
+@keyframes flashcell {
+  0% { background-color: rgba(62, 207, 142, 0.32); }
+  100% { background-color: transparent; }
+}
+.price-flash {
+  animation: flashcell 1.4s ease-out both;
+  border-radius: 4px;
+}
+
 @theme {
   --font-display: "Space Grotesk", "Instrument Sans", sans-serif;
   --font-body: "Instrument Sans", "Segoe UI", sans-serif;

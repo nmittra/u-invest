@@ -20,6 +20,8 @@ export interface Position {
   entryDate: string; // ISO yyyy-mm-dd
   entryPrice: number;
   currentPrice: number | null;
+  /** epoch ms of the last time currentPrice was set (manual or live refresh) */
+  lastPriceUpdate?: number;
   /** size as % of account */
   sizePct: number;
   thesis: string;
