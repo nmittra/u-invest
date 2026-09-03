@@ -1,20 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ExitReason, Position, Toast, Vault, View } from "./lib/types";
 import {
   advanceByCadence,
-  closeSession,
+  createVault,
   exportVault,
+  fmtDate,
+  forgetKey,
   freshAccount,
-  hasSession,
-  loadVault,
-  openSession,
+  getVaultMeta,
+  IDLE_LOCK_MINUTES,
+  persistVault,
+  rekeyVault,
   samplePosition,
-  saveVault,
   todayISO,
   uid,
+  unlockVault,
   wipeVault,
 } from "./lib/store";
-import { fmtDate } from "./lib/store";
 import { Sidebar } from "./components/Sidebar";
 import { LockScreen } from "./components/LockScreen";
 import { TickerTape } from "./components/TickerTape";
@@ -26,12 +28,15 @@ import { ExitModal } from "./components/ExitModal";
 import { GutCheck } from "./components/GutCheck";
 import { Rulebook } from "./components/Rulebook";
 import { ClosedLedger } from "./components/ClosedLedger";
+import { SecurityModal } from "./components/SecurityModal";
 import { ToastStack } from "./components/ui";
-import { IconLock, IconPulse, LogoMark } from "./components/icons";
+import { IconLock, IconPulse, IconShield, LogoMark } from "./components/icons";
 
 export default function App() {
-  const [vault, setVault] = useState<Vault | null>(() => loadVault());
-  const [unlocked, setUnlocked] = useState<boolean>(() => hasSession() && !!loadVault());
+  const [meta, setMeta] = useState(() => getVaultMeta());
+  const [vault, setVault] = useState<Vault | null>(null);
+  const [ownerName, setOwnerName] = useState("");
+  const [unlocked, setUnlocked] = useState(false);
   const [view, setView] = useState<View>("desk");
   const [selectedId, setSelectedId] = useState<string>("all");
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -41,11 +46,10 @@ export default function App() {
   const [reviewFor, setReviewFor] = useState<Position | null>(null);
   const [exitFor, setExitFor] = useState<{ p: Position; reason?: ExitReason } | null>(null);
   const [gutOpen, setGutOpen] = useState(false);
+  const [secOpen, setSecOpen] = useState(false);
 
-  /* persist */
-  useEffect(() => {
-    if (vault && unlocked) saveVault(vault);
-  }, [vault, unlocked]);
+  /** The password lives only in memory while the book is open — needed to re-seal on every save. */
+  const passwordRef = useRef<string | null>(null);
 
   const toast = useCallback((t: Omit<Toast, "id">) => {
     const id = uid();
@@ -55,26 +59,98 @@ export default function App() {
 
   /* ---------------- auth ---------------- */
 
-  function handleCreate(v: Vault) {
-    const withAccount: Vault = { ...v, accounts: [freshAccount("Main account", null)] };
-    setVault(withAccount);
-    saveVault(withAccount);
-    openSession();
+  async function handleCreate(name: string, pw: string) {
+    const seed: Vault = { accounts: [freshAccount("Main account", null, "Trading")], positions: [], closed: [] };
+    await createVault(name, pw, seed);
+    passwordRef.current = pw;
+    setOwnerName(name);
+    setVault(seed);
     setUnlocked(true);
-    toast({ tone: "moss", title: `The book is open, ${v.profile.name}.`, detail: "A “Main account” was created — add more from the sidebar." });
+    setMeta({ name, counts: null });
+    toast({
+      tone: "moss",
+      title: `The book is open, ${name}.`,
+      detail: "Encrypted and sealed on this device. A “Main account” was created — add your ISA, SIPP and the rest from the sidebar.",
+    });
   }
 
-  function handleUnlock(v: Vault) {
-    openSession();
+  async function handleUnlock(pw: string): Promise<boolean> {
+    const v = await unlockVault(pw);
+    if (!v) return false;
+    passwordRef.current = pw;
+    setOwnerName(meta?.name ?? "");
     setVault(v);
     setUnlocked(true);
     toast({ tone: "moss", title: "Book unlocked.", detail: "Plan first. Prices second." });
+    return true;
   }
 
-  function handleLock() {
-    closeSession();
+  const closeModals = useCallback(() => {
+    setFormOpen(false);
+    setEditing(null);
+    setReviewFor(null);
+    setExitFor(null);
+    setGutOpen(false);
+    setSecOpen(false);
+  }, []);
+
+  const handleLock = useCallback(
+    (reason?: "idle") => {
+      forgetKey();
+      passwordRef.current = null;
+      setVault(null);
+      setUnlocked(false);
+      setView("desk");
+      closeModals();
+      if (reason === "idle") {
+        toast({
+          tone: "flare",
+          title: "Locked after inactivity.",
+          detail: `${IDLE_LOCK_MINUTES} minutes idle — the book sealed itself. Your password reopens it.`,
+        });
+      }
+    },
+    [closeModals, toast],
+  );
+
+  /* auto-lock on inactivity */
+  useEffect(() => {
+    if (!unlocked) return;
+    const ms = IDLE_LOCK_MINUTES * 60_000;
+    let t = window.setTimeout(() => handleLock("idle"), ms);
+    const reset = () => {
+      window.clearTimeout(t);
+      t = window.setTimeout(() => handleLock("idle"), ms);
+    };
+    const evs = ["pointerdown", "keydown", "wheel", "touchstart"];
+    evs.forEach((e) => window.addEventListener(e, reset, { passive: true }));
+    return () => {
+      window.clearTimeout(t);
+      evs.forEach((e) => window.removeEventListener(e, reset));
+    };
+  }, [unlocked, handleLock]);
+
+  /* persist (re-encrypt) on every change while open */
+  useEffect(() => {
+    if (vault && unlocked && passwordRef.current) {
+      void persistVault(vault, ownerName, passwordRef.current).catch(() => {});
+    }
+  }, [vault, unlocked, ownerName]);
+
+  function handleWipe() {
+    wipeVault();
+    setMeta(null);
+    setVault(null);
     setUnlocked(false);
-    setView("desk");
+    closeModals();
+    toast({ tone: "fog", title: "Vault erased.", detail: "This device is a blank page again." });
+  }
+
+  async function handleChangePassword(newPw: string) {
+    if (!vault) return;
+    await rekeyVault(vault, ownerName, newPw);
+    passwordRef.current = newPw;
+    toast({ tone: "moss", title: "Password changed.", detail: "The whole book was re-sealed under the new key." });
   }
 
   /* ---------------- derived ---------------- */
@@ -100,11 +176,20 @@ export default function App() {
     setVault((prev) => (prev ? fn(prev) : prev));
   }
 
-  function addAccount(name: string, value: number | null) {
-    const acc = freshAccount(name, value);
+  function addAccount(name: string, value: number | null, wrapper?: string) {
+    const acc = freshAccount(name, value, wrapper);
     mutate((v) => ({ ...v, accounts: [...v.accounts, acc] }));
     setSelectedId(acc.id);
-    toast({ tone: "moss", title: `Account “${name}” added.`, detail: "Positions you log will file under it." });
+    toast({
+      tone: "moss",
+      title: `Account “${name}” added${wrapper && wrapper !== name ? ` · ${wrapper}` : ""}.`,
+      detail: "Positions you log will file under it. Size limits are tracked per account.",
+    });
+  }
+
+  function renameAccount(id: string, name: string) {
+    mutate((v) => ({ ...v, accounts: v.accounts.map((a) => (a.id === id ? { ...a, name } : a)) }));
+    toast({ tone: "fog", title: `Account renamed to “${name}”.` });
   }
 
   function deleteAccount(id: string) {
@@ -119,10 +204,12 @@ export default function App() {
   }
 
   function savePosition(p: Position) {
-    mutate((v) => {
-      const exists = v.positions.some((x) => x.id === p.id);
-      return { ...v, positions: exists ? v.positions.map((x) => (x.id === p.id ? p : x)) : [...v.positions, p] };
-    });
+    mutate((v) => ({
+      ...v,
+      positions: v.positions.some((x) => x.id === p.id)
+        ? v.positions.map((x) => (x.id === p.id ? p : x))
+        : [...v.positions, p],
+    }));
     setFormOpen(false);
     setEditing(null);
     toast({
@@ -228,7 +315,7 @@ export default function App() {
     return (
       <>
         <BackgroundLayers />
-        <LockScreen vault={vault} onUnlock={handleUnlock} onCreate={handleCreate} />
+        <LockScreen meta={meta} onUnlock={handleUnlock} onCreate={handleCreate} onWipe={handleWipe} />
         <ToastStack toasts={toasts} dismiss={(id) => setToasts((p) => p.filter((t) => t.id !== id))} />
       </>
     );
@@ -253,7 +340,10 @@ export default function App() {
               <button onClick={() => setGutOpen(true)} className="p-2 rounded-md text-flare-400 hover:bg-pine-800 transition-colors" aria-label="Gut-check">
                 <IconPulse size={17} />
               </button>
-              <button onClick={handleLock} className="p-2 rounded-md text-fog-500 hover:text-ember-300 hover:bg-pine-800 transition-colors" aria-label="Lock">
+              <button onClick={() => setSecOpen(true)} className="p-2 rounded-md text-fog-500 hover:text-moss-300 hover:bg-pine-800 transition-colors" aria-label="Security">
+                <IconShield size={17} />
+              </button>
+              <button onClick={() => handleLock()} className="p-2 rounded-md text-fog-500 hover:text-ember-300 hover:bg-pine-800 transition-colors" aria-label="Lock">
                 <IconLock size={17} />
               </button>
             </div>
@@ -292,28 +382,30 @@ export default function App() {
 
         <div className="flex flex-1 w-full max-w-[1440px] mx-auto">
           <Sidebar
-            profileName={vault.profile.name}
+            profileName={ownerName}
             view={view}
             setView={setView}
             accounts={vault.accounts}
             selectedId={selectedId}
             selectAccount={setSelectedId}
             addAccount={addAccount}
+            renameAccount={renameAccount}
             deleteAccount={deleteAccount}
             positions={vault.positions}
             closedCount={vault.closed.length}
+            onOpenSecurity={() => setSecOpen(true)}
             onExport={() => {
               exportVault(vault);
-              toast({ tone: "moss", title: "Backup exported.", detail: "JSON file with the whole book — keep it somewhere safe." });
+              toast({ tone: "moss", title: "Backup exported.", detail: "Plain-JSON file with the whole book — keep it somewhere safe." });
             }}
-            onLock={handleLock}
+            onLock={() => handleLock()}
           />
 
           <main className="flex-1 min-w-0 px-4 sm:px-7 py-7 sm:py-9">
             <div key={`${view}-${selectedId}`}>
               {view === "desk" && (
                 <Dashboard
-                  profileName={vault.profile.name}
+                  profileName={ownerName}
                   accountName={accountName}
                   positions={positions}
                   closed={closed}
@@ -346,7 +438,7 @@ export default function App() {
                   onLoadSample={loadSample}
                 />
               )}
-              {view === "rules" && <Rulebook profileName={vault.profile.name} />}
+              {view === "rules" && <Rulebook profileName={ownerName} />}
               {view === "closed" && <ClosedLedger closed={closed} accountName={accountName} />}
             </div>
           </main>
@@ -388,6 +480,14 @@ export default function App() {
         />
       )}
       {gutOpen && <GutCheck onClose={() => setGutOpen(false)} />}
+      {secOpen && (
+        <SecurityModal
+          ownerName={ownerName}
+          onChangePassword={handleChangePassword}
+          onErase={handleWipe}
+          onClose={() => setSecOpen(false)}
+        />
+      )}
 
       <ToastStack toasts={toasts} dismiss={(id) => setToasts((p) => p.filter((t) => t.id !== id))} />
     </>

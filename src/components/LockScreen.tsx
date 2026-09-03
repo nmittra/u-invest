@@ -1,8 +1,6 @@
 import { useState } from "react";
-import type { Profile, Vault } from "../lib/types";
-import { blankProfile, hashPassword, makeSalt, wipeVault } from "../lib/store";
 import { btnPrimary, Field, inputCls } from "./ui";
-import { IconAlert, IconEye, IconEyeOff, IconLock, IconUnlock, LogoMark } from "./icons";
+import { IconAlert, IconEye, IconEyeOff, IconLock, IconShield, IconUnlock, LogoMark } from "./icons";
 
 const HOUSE_RULES = [
   { n: "01", text: "Every position is classified at purchase — before price moves and emotion enters." },
@@ -10,14 +8,21 @@ const HOUSE_RULES = [
   { n: "03", text: "Sleeve 2 cores have no price stop — only pre-written, falsifiable invalidation facts." },
 ];
 
+export interface VaultMeta {
+  name: string;
+  counts: { open: number; accounts: number } | null;
+}
+
 export function LockScreen({
-  vault,
+  meta,
   onUnlock,
   onCreate,
+  onWipe,
 }: {
-  vault: Vault | null;
-  onUnlock: (v: Vault) => void;
-  onCreate: (v: Vault) => void;
+  meta: VaultMeta | null;
+  onUnlock: (password: string) => Promise<boolean>;
+  onCreate: (name: string, password: string) => Promise<void>;
+  onWipe: () => void;
 }) {
   return (
     <div className="relative z-10 min-h-screen flex items-center justify-center px-4 py-10">
@@ -52,8 +57,8 @@ export function LockScreen({
 
         {/* form side */}
         <div className="rise" style={{ animationDelay: "0.1s" }}>
-          {vault?.profile ? (
-            <UnlockForm vault={vault} onUnlock={onUnlock} />
+          {meta ? (
+            <UnlockForm meta={meta} onUnlock={onUnlock} onWipe={onWipe} />
           ) : (
             <CreateForm onCreate={onCreate} />
           )}
@@ -63,27 +68,47 @@ export function LockScreen({
   );
 }
 
+/* ------------------------------------------------ shared bits ------------------------------------------------ */
+
+function SealPlate() {
+  return (
+    <div className="mt-5 flex items-center gap-2.5 rounded-md border border-line bg-pine-900/70 px-3.5 py-2.5">
+      <IconShield size={15} className="shrink-0 text-moss-400" />
+      <p className="font-mono text-[10.5px] leading-snug text-fog-500 tracking-wide">
+        AES-256-GCM · key derived on this device · the password itself is never stored
+      </p>
+    </div>
+  );
+}
+
 /* ------------------------------------------------ unlock ------------------------------------------------ */
 
-function UnlockForm({ vault, onUnlock }: { vault: Vault; onUnlock: (v: Vault) => void }) {
+function UnlockForm({
+  meta,
+  onUnlock,
+  onWipe,
+}: {
+  meta: VaultMeta;
+  onUnlock: (password: string) => Promise<boolean>;
+  onWipe: () => void;
+}) {
   const [pw, setPw] = useState("");
   const [show, setShow] = useState(false);
   const [err, setErr] = useState(false);
   const [busy, setBusy] = useState(false);
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const legacy = meta.counts !== null;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (!pw || busy) return;
     setBusy(true);
-    const h = await hashPassword(vault.profile.salt, pw);
+    const ok = await onUnlock(pw);
     setBusy(false);
-    if (h === vault.profile.hash) {
-      onUnlock(vault);
-    } else {
+    if (!ok) {
       setErr(true);
       setPw("");
-      setTimeout(() => setErr(false), 500);
+      setTimeout(() => setErr(false), 550);
     }
   }
 
@@ -100,12 +125,20 @@ function UnlockForm({ vault, onUnlock }: { vault: Vault; onUnlock: (v: Vault) =>
             <IconLock size={19} />
           </span>
           <div>
-            <h2 className="font-display font-bold text-xl text-fog-100 leading-tight">Welcome back, {vault.profile.name}.</h2>
+            <h2 className="font-display font-bold text-xl text-fog-100 leading-tight">Welcome back, {meta.name}.</h2>
             <p className="text-[13px] text-fog-500 mt-0.5">
-              {vault.positions.length} open position{vault.positions.length === 1 ? "" : "s"} · {vault.accounts.length} account{vault.accounts.length === 1 ? "" : "s"}
+              {legacy
+                ? `${meta.counts!.open} open position${meta.counts!.open === 1 ? "" : "s"} · ${meta.counts!.accounts} account${meta.counts!.accounts === 1 ? "" : "s"}`
+                : "Your positions are sealed. Password required."}
             </p>
           </div>
         </div>
+
+        {legacy && (
+          <p className="mt-4 text-[11.5px] leading-snug text-flare-300 border-l-2 border-flare-500/50 pl-3">
+            Legacy vault detected — the moment you unlock it, it will be re-saved fully encrypted.
+          </p>
+        )}
 
         <div className="mt-6">
           <Field label="Password">
@@ -130,24 +163,21 @@ function UnlockForm({ vault, onUnlock }: { vault: Vault; onUnlock: (v: Vault) =>
           </Field>
         </div>
 
+        {err && <p className="mt-2 text-[12.5px] text-ember-300">Wrong password — the seal held. Try again.</p>}
+
         <button type="submit" disabled={!pw || busy} className={`${btnPrimary} w-full mt-5 py-3`}>
           <IconUnlock size={16} />
-          {busy ? "Checking…" : "Open the rulebook"}
+          {busy ? "Decrypting…" : "Open the rulebook"}
         </button>
 
-        <div className="mt-6 pt-4 border-t border-line flex items-center justify-between">
+        <SealPlate />
+
+        <div className="mt-5 pt-4 border-t border-line flex items-center justify-between">
           <span className="text-[11.5px] text-fog-600">Stored only on this device.</span>
           {confirmWipe ? (
             <span className="flex items-center gap-2 text-[11.5px]">
               <span className="text-ember-300">Erase everything?</span>
-              <button
-                type="button"
-                className="text-ember-400 font-semibold hover:underline"
-                onClick={() => {
-                  wipeVault();
-                  window.location.reload();
-                }}
-              >
+              <button type="button" className="text-ember-400 font-semibold hover:underline" onClick={onWipe}>
                 Yes, erase
               </button>
               <button type="button" className="text-fog-500 hover:underline" onClick={() => setConfirmWipe(false)}>
@@ -167,7 +197,7 @@ function UnlockForm({ vault, onUnlock }: { vault: Vault; onUnlock: (v: Vault) =>
 
 /* ------------------------------------------------ first run ------------------------------------------------ */
 
-function CreateForm({ onCreate }: { onCreate: (v: Vault) => void }) {
+function CreateForm({ onCreate }: { onCreate: (name: string, password: string) => Promise<void> }) {
   const [name, setName] = useState("");
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
@@ -181,10 +211,7 @@ function CreateForm({ onCreate }: { onCreate: (v: Vault) => void }) {
     e.preventDefault();
     if (!name.trim() || !pwOk || !match || busy) return;
     setBusy(true);
-    const salt = makeSalt();
-    const hash = await hashPassword(salt, pw);
-    const profile: Profile = blankProfile(name.trim(), salt, hash);
-    onCreate({ profile, accounts: [], positions: [], closed: [] });
+    await onCreate(name.trim(), pw);
   }
 
   return (
@@ -197,14 +224,19 @@ function CreateForm({ onCreate }: { onCreate: (v: Vault) => void }) {
         </div>
         <h2 className="font-display font-bold text-2xl text-fog-100 tracking-tight">Open your rulebook.</h2>
         <p className="text-[13.5px] text-fog-500 mt-1.5 leading-relaxed">
-          Name it, lock it. Everything you log stays in this browser — no servers, no accounts elsewhere.
+          Name it, lock it. The whole book is encrypted with a key derived from your password — nothing is stored in
+          plain text, and nothing ever leaves this browser.
         </p>
 
         <div className="mt-6 space-y-4">
-          <Field label="Your name" hint="how the book greets you">
+          <Field label="Your name" hint="how the book greets you — the only thing stored unencrypted">
             <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Dana" autoFocus />
           </Field>
-          <Field label="Password" hint="min. 4 characters" error={pw.length > 0 && !pwOk ? "At least 4 characters." : undefined}>
+          <Field
+            label="Password"
+            hint="min. 4 characters — longer is stronger"
+            error={pw.length > 0 && !pwOk ? "At least 4 characters." : undefined}
+          >
             <div className="relative">
               <input
                 type={show ? "text" : "password"}
@@ -238,9 +270,14 @@ function CreateForm({ onCreate }: { onCreate: (v: Vault) => void }) {
           {busy ? "Sealing…" : "Create my rulebook"}
         </button>
 
+        <SealPlate />
+
         <div className="mt-4 flex items-start gap-2 text-[11.5px] text-fog-600 leading-snug">
           <IconAlert size={13} className="mt-0.5 shrink-0" />
-          <span>If you lose this password the book can't be reopened — use the export/backup once you're inside.</span>
+          <span>
+            No recovery by design: if you lose this password the book can't be reopened. Once inside, export a backup
+            and keep it somewhere safe.
+          </span>
         </div>
       </form>
     </div>
